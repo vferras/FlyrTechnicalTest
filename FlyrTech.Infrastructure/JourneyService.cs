@@ -14,6 +14,7 @@ public class JourneyService : IJourneyService
     private readonly ICacheService _cacheService;
     private const string JourneyKeyPrefix = "journey:";
     private const string JourneyIdsKey = "journey:ids";
+    private static SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
 
     public JourneyService(ICacheService cacheService)
     {
@@ -43,33 +44,41 @@ public class JourneyService : IJourneyService
     {
         if (string.IsNullOrWhiteSpace(journeyId))
             throw new ArgumentException("Journey ID cannot be null or empty", nameof(journeyId));
-        
+
         if (string.IsNullOrWhiteSpace(segmentId))
             throw new ArgumentException("Segment ID cannot be null or empty", nameof(segmentId));
 
-        // STEP 1: Read the entire journey from cache
-        var journey = await GetJourneyAsync(journeyId);
-        
-        if (journey == null)
-            return false;
+        await _semaphore.WaitAsync();
+        try
+        {
+            // STEP 1: Read the entire journey from cache
+            var journey = await GetJourneyAsync(journeyId);
 
-        // STEP 2: Find and modify the segment
-        var segment = journey.Segments.FirstOrDefault(s => s.SegmentId == segmentId);
-        
-        if (segment == null)
-            return false;
+            if (journey == null)
+                return false;
 
-        // Simulate some processing time to increase the chance of race conditions
-        await Task.Delay(10);
+            // STEP 2: Find and modify the segment
+            var segment = journey.Segments.FirstOrDefault(s => s.SegmentId == segmentId);
 
-        segment.Status = newStatus;
+            if (segment == null)
+                return false;
 
-        // STEP 3: Write the entire journey back to cache
-        // PROBLEM: If another thread modified the journey between steps 1 and 3,
-        // those changes will be lost (overwritten by this update)
-        var key = GetJourneyKey(journeyId);
-        var json = JsonSerializer.Serialize(journey);
-        await _cacheService.SetAsync(key, json);
+            // Simulate some processing time to increase the chance of race conditions
+            await Task.Delay(10);
+
+            segment.Status = newStatus;
+
+            // STEP 3: Write the entire journey back to cache
+            // PROBLEM: If another thread modified the journey between steps 1 and 3,
+            // those changes will be lost (overwritten by this update)
+            var key = GetJourneyKey(journeyId);
+            var json = JsonSerializer.Serialize(journey);
+            await _cacheService.SetAsync(key, json);
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
 
         return true;
     }
@@ -79,24 +88,32 @@ public class JourneyService : IJourneyService
         if (string.IsNullOrWhiteSpace(journeyId))
             throw new ArgumentException("Journey ID cannot be null or empty", nameof(journeyId));
 
-        var journey = await GetJourneyAsync(journeyId);
+        await _semaphore.WaitAsync();
+        try
+        {
+            var journey = await GetJourneyAsync(journeyId);
+
+            if (journey == null)
+                return false;
+
+            journey.Status = newStatus;
+
+            var key = GetJourneyKey(journeyId);
+            var json = JsonSerializer.Serialize(journey);
+            await _cacheService.SetAsync(key, json);
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
         
-        if (journey == null)
-            return false;
-
-        journey.Status = newStatus;
-
-        var key = GetJourneyKey(journeyId);
-        var json = JsonSerializer.Serialize(journey);
-        await _cacheService.SetAsync(key, json);
-
         return true;
     }
 
     public async Task<List<string>> GetAllJourneyIdsAsync()
     {
         var json = await _cacheService.GetAsync(JourneyIdsKey);
-        
+
         if (json == null)
             return new List<string>();
 

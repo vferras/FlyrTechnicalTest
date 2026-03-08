@@ -12,35 +12,88 @@ Complete this document with your detailed technical analysis of the race conditi
 
 **Describe in detail why the race condition occurs:**
 
-[Your answer here]
+The race condition happens because the servers running the APIs can handle multiple requests concurrently. That means that in case we perform a read-modify-write in a non thread-safe manner then we will end up with race conditions and corrupted data. In that case we have a method called UpdateSegmentStatusAsync that is reading from the cache, modifying the value, and persisting the modified value without any kind of concurrency protection (like a lock).
 
 **Create a sequence diagram or timeline showing how 3 concurrent threads cause data loss:**
 
-``text
-[Your diagram here - you can use ASCII art, mermaid syntax, or attach an image]
-``
+```mermaid
+sequenceDiagram
+    participant T1 as Thread 1
+    participant T2 as Thread 2
+    participant T3 as Thread 3
+    participant C as Cache
+
+    T1->>C: Read
+    C-->>T1: 1
+    T2->>C: Read
+    C-->>T2: 1
+    T3->>C: Read
+    C-->>T3: 1
+
+    T1->>C: Write 2 (1+1)
+    T2->>C: Write 2 (1+1, should be 3)
+    T3->>C: Write 2 (1+1, should be 4)
+```
 
 **Identify all critical sections in the code:**
 
-[Your answer here]
+There are 2 critical sections in JourneyService.cs where the read-modify-write are acting:
+
+1. UpdateSegmentStatusAsync method: 
+    1. GetJourneyAsync()       → reads the full journey object from cache
+    2. segment.Status = ...    → modifies a field in the in-memory object
+    3. _cacheService.SetAsync()→ writes the entire journey back to cache
+
+2. UpdateJourneyStatusAsync method:
+    1. GetJourneyAsync()       → reads the full journey object from cache
+    2. journey.Status = ...    → modifies the status in-memory
+    3. _cacheService.SetAsync()→ writes the entire journey back to cache
+
 
 **Calculate the probability of collision with N concurrent operations:**
 
-[Your mathematical analysis here]
+A collision occurs when two or more threads read the same journey before any of them has written back, considering the critical time window (in our code are the 
+10ms caused by the Task.Delay(10)).
+To give a rough calculation of the probability of a collision, we can use an approximation from the "birthday problem" (or "birthday paradox"):
+
+P(collision) = 1 - e^(-N²·t / T)
+
+Where:
+
+    N = number of concurrent threads.
+    t = duration (in our case the critical time window).
+    T = total time the system have been running (we can also call it observation window).
+
+Examples:
+
+    2 threads -> N ~ 18%
+    5 threads -> N ~ 71%
+    10 threads -> N ~ 99%
+
+So we can say that with 5 thread, and given the Task.Delay(10), the probability of a collision is already more than 50%, and with 10 threads the probability is almost 100%.
 
 ### 1.2 Impact Assessment
 
 **What are the business consequences of this race condition?**
 
-[Your answer here]
+The business consequences of the issue are that the Segments may end up with a wrong Status, and therefore decissions taken from segment status field may also be wrong. Even worst, if the data is shown to the customers, we may be giving wrong data to the customers, impacting heavily the customer experience. Also, given that this is a silent issue, in production would be hard to catch.
 
 **Which scenarios are most likely to trigger this issue in production?**
 
-[Your answer here]
+The scenarios where the rate (req/s) is very high are the ones more likely to trigger this issue:
+
+- Departure or arrivals during peak hours, where the statuses may be updated.
+- Retries from clients for any reason
+- Batching requests form the clients
 
 **How would you detect this issue in production?**
 
-[Your answer here]
+Since the bug is silent (no errors thrown, always returns true), detection requires observability built around data consistency, and not exceptions.
+This observability should be considering custom metrics, and I could think of different ways to detect:
+
+- Custom metric checking different sources for the status (different read models or comparing with a source of truth if possible). If the statuses for the Segment mismatch, then we can raise an alert.
+- That option is more a fix rather than a way to detect it, although it can be used to detect it: and that is using versioning for the updates. Each journey update stores a version field in cache, and every write increments the value. And before each update, we check the current version stored vs the expected version, and if they mismatch (current version + 1 > expected version) means that another thread updated the value in between. In that case we would raise an alert, or preferably, force that update to be retried and go through the read-modify-write again.
+- Although is not my preferred solution, another option would be to log each update with the expected value, so you can periodicly do kind of a state reconciliation.
 
 ---
 
@@ -55,34 +108,64 @@ For each solution, provide:
 - Performance implications
 - Complexity analysis
 
-### Solution 1: [Name your approach]
+### Solution 1: First iteration - Using SemaphoreSlim
 
 **Architecture Overview:**
 
-[Your description here]
+A `SemaphoreSlim(1, 1)` is declared as a `static` field in `JourneyService`. Before entering the critical section (read → modify → write), each thread calls `WaitAsync()` to acquire the semaphore. Only one thread can proceed at a time and all others wait. Once the write is complete, `Release()` is called inside a `finally` block to guarantee the lock is always released, even if an exception is thrown.
 
 **Implementation Approach:**
 
-``csharp
-// Pseudocode or key code snippets
-``
+```csharp
+private static SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
+
+public async Task<bool> UpdateSegmentStatusAsync(string journeyId, string segmentId, string newStatus)
+{
+    await _semaphore.WaitAsync();
+    try
+    {
+        // STEP 1: Read
+        var journey = await GetJourneyAsync(journeyId);
+        if (journey == null) return false;
+
+        // STEP 2: Modify
+        var segment = journey.Segments.FirstOrDefault(s => s.SegmentId == segmentId);
+        if (segment == null) return false;
+        segment.Status = newStatus;
+
+        // STEP 3: Write back
+        var key = GetJourneyKey(journeyId);
+        await _cacheService.SetAsync(key, JsonSerializer.Serialize(journey));
+    }
+    finally
+    {
+        _semaphore.Release();
+    }
+    return true;
+}
+```
 
 **Pros:**
-- [List advantages]
+- Simple to implement and easy to reason about
+- Correctly prevents the race condition for a single-instance deployment
+- `finally` block guarantees the lock is always released
 
 **Cons:**
-- [List disadvantages]
+- **Hard and global lock** — Two threads updating different journeys will still block each other unnecessarily, and that leads to the next point.
+- Significant throughput reduction under high concurrency: the system can only process one update at a time
 
 **Performance Impact:**
-- Throughput: [Your analysis]
-- Latency: [Your analysis]
-- Resource usage: [Your analysis]
+- Throughput: Severely reduced under concurrency: single-threaded for all updates
+- Latency: Increases linearly while the queue grows: under high load, threads wait for all previous updates to complete
+- Resource usage: Minimal... `SemaphoreSlim` is lightweight and does not allocate threads
 
 **Edge Cases Handled:**
-- [List edge cases this solution handles]
+- Concurrent updates to the same (or different) journeys within a single process
+- Exception safety: `Release()` is always called via `finally`
 
 **Edge Cases NOT Handled:**
-- [List limitations]
+- Multiple API instances / horizontal scaling, the lock is not shared across processes, more relevant with distributed cache/db like Redis.
+- Unnecessarily blocks updates to different journeys
 
 ---
 
