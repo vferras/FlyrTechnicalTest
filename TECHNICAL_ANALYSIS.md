@@ -342,53 +342,100 @@ With Solution 2:
 
 **What happens if Redis becomes unavailable during an update?**
 
-[Your answer here]
+If Redis goes down during an update, the `GetAsync` or `CompareAndSetAsync` calls will throw a `RedisConnectionException`. Since we are not catching that exception, it will propagate up to the controller and return a 500 to the client. This is actually the best approach: we should not silently swallow the error, because the update did not happen and the caller needs to know.
+
+To handle this gracefully, we could:
+- Wrap the calls with a try-catch at the controller/middleware level and return a proper error response (e.g., 503 Service Unavailable) with a `Retry-After` header.
+- Use a circuit breaker pattern (e.g., Polly) to stop hammering Redis when it is down and fail fast instead.
 
 **How would you handle partial failures?**
 
-[Your answer here]
+In our case, each update is a single atomic operation (either the `CompareAndSetAsync` succeeds or it doesn't), so there is no real "partial" state within a single update. The journey is either fully updated or not touched at all. There are no other I/O, so there's neither a distributed transaction.
 
 **What's your retry strategy?**
 
-[Your answer here]
+There are two levels of retries:
+
+1. **Application-level (optimistic concurrency)**: already implemented with `MaxRetries = 50` in Solution 3. This handles version conflicts when multiple threads update the same journey concurrently. 50 retries is generous enough to handle realistic contention.
+
+2. **Infrastructure-level (Redis failures)**: for transient network errors or brief Redis unavailability, I would use Polly with an exponential backoff strategy (e.g., 3 retries with delays of 100ms, 500ms, 2s). If Redis is down for longer, the circuit breaker should open and fail fast.
 
 ### 4.2 Observability
 
 **What metrics would you track?**
 
-[Your answer here]
+- **Sucessful updates**: counter for updates that returned `true` and where successfuly updated.
+
+- **Failed updates** (exhausted retries): counter for updates that returned `false` after all retries.
+
+- **Update latency** (p50, p95, p99): time from request to successful write (200 responses).
+
+- **Redis connection errors**: count of `RedisConnectionException` occurrences.
+
+- **Version mismatch**: difference between the version read and the version found at write time, to understand how much collisions are happening.
+
+- **Memory and CPU**: monitor memory and cpu consumtion. Memory is specially critical on Scenario 2.
+
+- **API HTTP responses**: monitor the 2xx, 4xx and 5xx to know healthiness of the API.
+
+- **Dependency healthiness**: monitor if dependencies are healthy. In our case check that Redis is up and running.
 
 **What alerts would you set up?**
 
-[Your answer here]
+- **High retry rate**: alert if the average retries per update exceeds a threshold (e.g., > 5), which signals high collisions.
+- **Failed updates**: alert if any update exhausts all retries, as this means data was not updated and the client received a failure.
+- **Redis connectivity**: alert on Redis connection errors or latency spikes (e.g., p99 > 100ms).
+- **Error rate**: alert if the 5xx rate on the update endpoints exceeds a threshold (e.g., > 1%).
+- **High usage of CPU/memory**: alert when CPU/memory usage is getting higher than a threshold (e.g. 80%).
 
 **How would you debug issues in production?**
 
-[Your answer here]
+- **Logging**: log each update attempt with `journeyId`, `segmentId`, `attempt number`, `original version`, and `success/failure`. This allows tracing the full retry history of a specific update.
+- **Correlation IDs**: propagate a request ID through all log entries so you can follow a single request across retries.
+- **Redis monitoring**: if Redis is the bottleneck, use the built-in monitoring to check what is going on.
+- **Dashboards**: a Grafana dashboard showing the metrics mentioned above would be very useful to know what is going on in the system.
 
 ### 4.3 Deployment Strategy
 
 **How would you roll out this fix to production?**
 
-[Your answer here]
+There are different deployment strategies we can use to safely roll out this change. Each of them gives you a strategy to rollback in case the fix is not behaving as expected:
+
+1. **Feature flag**: deploy the new code behind a feature flag so we can switch between the old (broken) behavior and the new (fixed) behavior without redeploying.
+2. **Canary deployment**: route a small percentage of traffic (e.g., 5%) to the new version and monitor metrics (retry rates, error rates, latency) for anomalies. We can do that using a LB/service layer on our infrastructure.
+3. **Gradual rollout**: related to the previous one, if canary looks healthy, progressively increase traffic (25% → 50% → 100%) over a few hours or days.
+
+Note: in case we use Solution 3 we need to ensure all existing journeys in cache have a `Version` field. The `InitializeCacheAsync` method already sets `Version = 0`, but for any journeys already in cache we should run a one-time migration script to add the field.
 
 **What's your rollback plan if issues arise?**
 
-[Your answer here]
+- **Feature flag off**: if the fix introduces unexpected behavior, toggle the feature flag to revert to the previous implementation immediately, without needing a new deployment.
+- **Canary deployment**: switch all the traffic to the old version, and revert the new instance to the previous Docker image / deployment artifact.
+- **Cache corrupted**: if the data in cache is corrupted (e.g., wrong version numbers), flush the affected keys and let the system re-initialize.
 
 **How would you validate the fix in production?**
 
-[Your answer here]
+- **Run the concurrent update test** against a staging environment with production-like data and traffic.
+- **Monitor retry metrics**: after deployment, verify that retries are happening as expected (low retry count under normal load, no exhausted retries).
+- **Data consistency check**: compare segment statuses in cache against the source of truth (database) periodically to ensure no updates are being lost.
+- **Synthetic tests**: schedule a periodic job that performs concurrent updates to a test journey and verifies all updates are applied correctly.
 
 ### 4.4 Testing Strategy
 
 **What additional tests would you add beyond the existing ones?**
 
-[Your answer here]
+- **Unit tests for `CompareAndSetAsync`**: for Solution 3, verify that it correctly rejects writes when the version doesn't match, and accepts writes when it does.
+- **Performance tests**: test with 5, 20, 50, and 100 concurrent threads to validate behavior under different loads.
+- **Retry exhaustion test**: simulate an extreme condition (e.g., artifical big delays) to verify the system behaves correctly when `MaxRetries` is exhausted.
+- **Integration/end-to-end tests**: with integration tests we can spin up an instance of the api, hit the endpoints, and check that the integration with Redis works fine.
+- **End-to-end tests**: with this test we can simulate real user flows and check that API and Redis are properly working. As the system is too small and we only have Redis, those tests right now would be very similar to the integration testing.
+
 
 **How would you test this under realistic production load?**
 
-[Your answer here]
+- **Load testing with k6, JMeter, Gatling, etc.**: simulate realistic traffic patterns (mix of reads and writes, multiple journeys, etc.) against a staging (or any other very-close to reality) environment connected to a real Redis instance. If any, I would use existing metrics to simulate real loads.
+- **Chaos testing**: use tools like Chaos Monkey or Toxiproxy to introduce Redis latency, connection drops, and timeouts during load tests to validate resilience.
+- **Soak testing**: run the load test for an extended period (e.g., 24 hours) to detect memory leaks (especially relevant for Solution 2) and performance degradation over time.
 
 ---
 
