@@ -18,21 +18,23 @@ The race condition happens because the servers running the APIs can handle multi
 
 ```mermaid
 sequenceDiagram
-    participant T1 as Thread 1
-    participant T2 as Thread 2
-    participant T3 as Thread 3
+    participant T1 as Thread 1 (Seg-A → Boarding)
+    participant T2 as Thread 2 (Seg-B → Delayed)
+    participant T3 as Thread 3 (Seg-C → Cancelled)
     participant C as Cache
 
-    T1->>C: Read
-    C-->>T1: 1
-    T2->>C: Read
-    C-->>T2: 1
-    T3->>C: Read
-    C-->>T3: 1
+    T1->>C: Read Journey
+    C-->>T1: {Seg-A: Scheduled, Seg-B: Scheduled, Seg-C: Scheduled}
+    T2->>C: Read Journey
+    C-->>T2: {Seg-A: Scheduled, Seg-B: Scheduled, Seg-C: Scheduled}
+    T3->>C: Read Journey
+    C-->>T3: {Seg-A: Scheduled, Seg-B: Scheduled, Seg-C: Scheduled}
 
-    T1->>C: Write 2 (1+1)
-    T2->>C: Write 2 (1+1, should be 3)
-    T3->>C: Write 2 (1+1, should be 4)
+    T1->>C: Write {Seg-A: Boarding, Seg-B: Scheduled, Seg-C: Scheduled}
+    T2->>C: Write {Seg-A: Scheduled, Seg-B: Delayed, Seg-C: Scheduled}
+    Note right of C: T1's Boarding update is lost!
+    T3->>C: Write {Seg-A: Scheduled, Seg-B: Scheduled, Seg-C: Cancelled}
+    Note right of C: T1's and T2's updates are lost!
 ```
 
 **Identify all critical sections in the code:**
@@ -62,7 +64,7 @@ Where:
 
     N = number of concurrent threads.
     t = duration (in our case the critical time window).
-    T = total time the system have been running (we can also call it observation window).
+    T = total time the system has been running (we can also call it observation window).
 
 Examples:
 
@@ -70,13 +72,13 @@ Examples:
     5 threads -> N ~ 71%
     10 threads -> N ~ 99%
 
-So we can say that with 5 thread, and given the Task.Delay(10), the probability of a collision is already more than 50%, and with 10 threads the probability is almost 100%.
+So we can say that with 5 threads, and given the Task.Delay(10), the probability of a collision is already more than 50%, and with 10 threads the probability is almost 100%.
 
 ### 1.2 Impact Assessment
 
 **What are the business consequences of this race condition?**
 
-The business consequences of the issue are that the Segments may end up with a wrong Status, and therefore decissions taken from segment status field may also be wrong. Even worst, if the data is shown to the customers, we may be giving wrong data to the customers, impacting heavily the customer experience. Also, given that this is a silent issue, in production would be hard to catch.
+The business consequences of the issue are that the Segments may end up with a wrong Status, and therefore decisions taken from segment status field may also be wrong. Even worse, if the data is shown to the customers, we may be giving wrong data to the customers, impacting heavily the customer experience. Also, given that this is a silent issue, in production would be hard to catch.
 
 **Which scenarios are most likely to trigger this issue in production?**
 
@@ -84,7 +86,7 @@ The scenarios where the rate (req/s) is very high are the ones more likely to tr
 
 - Departure or arrivals during peak hours, where the statuses may be updated.
 - Retries from clients for any reason
-- Batching requests form the clients
+- Batching requests from the clients
 
 **How would you detect this issue in production?**
 
@@ -93,7 +95,7 @@ This observability should be considering custom metrics, and I could think of di
 
 - Custom metric checking different sources for the status (different read models or comparing with a source of truth if possible). If the statuses for the Segment mismatch, then we can raise an alert.
 - That option is more a fix rather than a way to detect it, although it can be used to detect it: and that is using versioning for the updates. Each journey update stores a version field in cache, and every write increments the value. And before each update, we check the current version stored vs the expected version, and if they mismatch (current version + 1 > expected version) means that another thread updated the value in between. In that case we would raise an alert, or preferably, force that update to be retried and go through the read-modify-write again (spoiler, that optimistic approach is going to be implemented in solution 3).
-- Although is not my preferred solution, another option would be to log each update with the expected value, so you can periodicly do kind of a state reconciliation.
+- Although is not my preferred solution, another option would be to log each update with the expected value, so you can periodically do kind of a state reconciliation.
 
 ---
 
@@ -287,7 +289,7 @@ Note: this requires adding a `Version` property to the `Journey` model and a `Co
 - This approach is widely known and used
 
 **Cons:**
-- **Big amount of retries under high  API rates**: if many threads update the same journey simultaneously, most will fail and retry, potentially amplifying load
+- **Big amount of retries under high API rates**: if many threads update the same journey simultaneously, most will fail and retry, potentially amplifying load
 - More complex to implement as requires changes to `ICacheService` interface and `Journey` model
 - Needs a `MaxRetries` limit and a strategy for what happens when retries are exhausted
 - Each retry re-reads from cache, adding extra round trips to the db/cache
@@ -318,14 +320,14 @@ Note: this requires adding a `Version` property to the `Journey` model and a `Co
 | Performance | Poor (global bottleneck) | Good (only same-key blocks) | Best under low api rates, degrades under high rates |
 | Scalability | Not scalable (single lock) | Scales well per journey | Scales horizontally (distributed-safe) |
 | Reliability | High (simple, hard to get wrong) | High (same guarantees, finer granularity) | Medium (retries can be exhausted) |
-| Implementation Time | ~30-60 min | ~1-2 hour | ~3-4 hours |
+| Implementation Time | ~30-60 min | ~1-2 hours | ~3-4 hours |
 | Maintenance Cost | Very low | Low (potential memory leak to manage) | Medium (versioning logic, retry tuning, Lua scripts) |
 
 ### 3.2 Recommended Solution
 
 **Which solution do you recommend for production and why?**
 
-For a **single-instance deployment**, I recommend **Solution 2** (per-key SemaphoreSlim). It provides the best balance between simplicity and performance: it eliminates the global bottleneck of Solution 1 by allowing parallel updates to different journeys, while keeping the implementation straightforward and easy to reason about. It guarantees correctness without the retry complexity of Solution 3. Specially if there are not much concurrent updates for the same id.
+For a **single-instance deployment**, I recommend **Solution 2** (per-key SemaphoreSlim). It provides the best balance between simplicity and performance: it eliminates the global bottleneck of Solution 1 by allowing parallel updates to different journeys, while keeping the implementation straightforward and easy to reason about. It guarantees correctness without the retry complexity of Solution 3. Especially if there are not many concurrent updates for the same id.
 
 **What are the trade-offs you're accepting with this choice?**
 
@@ -342,7 +344,7 @@ With Solution 2:
 
 **What happens if Redis becomes unavailable during an update?**
 
-If Redis goes down during an update, the `GetAsync` or `CompareAndSetAsync` calls will throw a `RedisConnectionException`. Since we are not catching that exception, it will propagate up to the controller and return a 500 to the client. This is actually the best approach: we should not silently swallow the error, because the update did not happen and the caller needs to know.
+If Redis goes down during an update, the `GetAsync` or `SetAsync` calls will throw a `RedisConnectionException`. Since we are not catching that exception, it will propagate up to the controller and return a 500 to the client. This is actually the best approach: we should not silently swallow the error, because the update did not happen and the caller needs to know.
 
 To handle this gracefully, we could:
 - Wrap the calls with a try-catch at the controller/middleware level and return a proper error response (e.g., 503 Service Unavailable) with a `Retry-After` header.
@@ -350,13 +352,13 @@ To handle this gracefully, we could:
 
 **How would you handle partial failures?**
 
-In our case, each update is a single atomic operation (either the `CompareAndSetAsync` succeeds or it doesn't), so there is no real "partial" state within a single update. The journey is either fully updated or not touched at all. There are no other I/O, so there's neither a distributed transaction.
+In our case, each update is a single atomic operation (either the `SetAsync` succeeds or it doesn't), so there is no real "partial" state within a single update. The journey is either fully updated or not touched at all. There are no other I/O, so there's neither a distributed transaction.
 
 **What's your retry strategy?**
 
 There are two levels of retries:
 
-1. **Application-level (optimistic concurrency)**: already implemented with `MaxRetries = 50` in Solution 3. This handles version conflicts when multiple threads update the same journey concurrently. 50 retries is generous enough to handle realistic contention.
+1. **Application-level (optimistic concurrency)**: only relevant if Solution 3 is chosen. In that case, it is already implemented with `MaxRetries = 50` to handle version conflicts when multiple threads update the same journey concurrently. For Solution 2, application-level retries are not needed since the semaphore guarantees mutual exclusion.
 
 2. **Infrastructure-level (Redis failures)**: for transient network errors or brief Redis unavailability, I would use Polly with an exponential backoff strategy (e.g., 3 retries with delays of 100ms, 500ms, 2s). If Redis is down for longer, the circuit breaker should open and fail fast.
 
@@ -364,7 +366,7 @@ There are two levels of retries:
 
 **What metrics would you track?**
 
-- **Sucessful updates**: counter for updates that returned `true` and where successfuly updated.
+- **Successful updates**: counter for updates that returned `true` and were successfully updated.
 
 - **Failed updates** (exhausted retries): counter for updates that returned `false` after all retries.
 
@@ -372,9 +374,9 @@ There are two levels of retries:
 
 - **Redis connection errors**: count of `RedisConnectionException` occurrences.
 
-- **Version mismatch**: difference between the version read and the version found at write time, to understand how much collisions are happening.
+- **Version mismatch**: difference between the version read and the version found at write time, to understand how many collisions are happening.
 
-- **Memory and CPU**: monitor memory and cpu consumtion. Memory is specially critical on Scenario 2.
+- **Memory and CPU**: monitor memory and CPU consumption. Memory is especially critical on Solution 2.
 
 - **API HTTP responses**: monitor the 2xx, 4xx and 5xx to know healthiness of the API.
 
@@ -426,7 +428,7 @@ Note: in case we use Solution 3 we need to ensure all existing journeys in cache
 
 - **Unit tests for `CompareAndSetAsync`**: for Solution 3, verify that it correctly rejects writes when the version doesn't match, and accepts writes when it does.
 - **Performance tests**: test with 5, 20, 50, and 100 concurrent threads to validate behavior under different loads.
-- **Retry exhaustion test**: simulate an extreme condition (e.g., artifical big delays) to verify the system behaves correctly when `MaxRetries` is exhausted.
+- **Retry exhaustion test**: simulate an extreme condition (e.g., artificial big delays) to verify the system behaves correctly when `MaxRetries` is exhausted.
 - **Integration/end-to-end tests**: with integration tests we can spin up an instance of the api, hit the endpoints, and check that the integration with Redis works fine.
 - **End-to-end tests**: with this test we can simulate real user flows and check that API and Redis are properly working. As the system is too small and we only have Redis, those tests right now would be very similar to the integration testing.
 
@@ -443,20 +445,23 @@ Note: in case we use Solution 3 we need to ensure all existing journeys in cache
 
 ### 5.1 Steps to Implement Your Chosen Solution
 
-1. [Step 1]
-2. [Step 2]
-3. [Step 3]
-...
+1. **Write a failing concurrency test**: create a test (if doesn't exist) that launches 20 concurrent updates to the same journey and asserts that all 20 updates are applied correctly (no data loss). This test should fail with the original (unprotected) implementation, proving the race condition exists.
+2. **Add a `ConcurrentDictionary<string, SemaphoreSlim>` and a helper method** to `JourneyService` to retrieve or create a semaphore per `journeyId`.
+3. **Wrap the read-modify-write logic** in `UpdateSegmentStatusAsync` with `await semaphore.WaitAsync()` and `semaphore.Release()` inside a `try/finally` block. Run the test from step 1 and they should now pass.
+4. **Write a failing unit test for parallel updates to different journeys**: assert that updates to two different journey IDs can execute concurrently and are not blocked by each other. Test should be red.
+5. **Apply the same locking pattern** to `UpdateJourneyStatusAsync`. Run all tests to confirm they pass.
+6. **Optional: add semaphore cleanup logic** to prevent unbounded memory growth, with a corresponding test that validates stale semaphores are cleaned up.
 
 ### 5.2 Estimated Implementation Time
 
-**Total time to implement:** [Your estimate]
+**Total time to implement:** ~4-6.5 hours
 
 **Breakdown:**
-- Core implementation: [Time]
-- Tests: [Time]
-- Documentation: [Time]
-- Code review cycles: [Time]
+- Failing tests first (steps 1, 2, 5): ~1-1.5 hours
+- Core implementation to make tests pass (steps 3, 4, 6): ~0.5-1 hour
+- Refactor and cleanup (if needed): ~0-0.5 hours
+- Optional semaphore cleanup + test (step 6): ~1.5-2 hours
+- Code review cycles: ~1-1.5 hours
 
 ---
 
@@ -464,4 +469,7 @@ Note: in case we use Solution 3 we need to ensure all existing journeys in cache
 
 **Any additional observations or considerations:**
 
-[Your notes here]
+- Solution 2 was chosen because the system runs as a single API instance. If horizontal scaling becomes a requirement in the future, migrating to Solution 3 (optimistic concurrency with versioning) would be the natural next step.
+- The `ConcurrentDictionary` memory growth is a known trade-off. For most use cases the number of distinct journey IDs in a given time window is bounded, so this is unlikely to be a problem in practice. If it becomes one, a periodic cleanup task can be added with minimal effort.
+- The implementation plan in part 5 was defined using the TDD approach. That's my preferred way to implement new things/fix bugs.
+- The git commit history shows how my thinking was evolving from the simplest approach to the more complex one, and those are the first 3 commits (First Iteration, Second Iteration and Third Iteration).
