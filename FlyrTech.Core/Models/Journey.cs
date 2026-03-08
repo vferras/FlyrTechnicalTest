@@ -13,6 +13,7 @@ public class Journey
     public decimal TotalPrice { get; set; }
     public List<Segment> Segments { get; set; } = new();
     public Dictionary<string, string> Metadata { get; set; } = new();
+    public int Version { get; set; }
 }
 
 /// <summary>

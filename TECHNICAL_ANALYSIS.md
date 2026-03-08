@@ -232,34 +232,79 @@ public async Task<bool> UpdateSegmentStatusAsync(string journeyId, string segmen
 
 ---
 
-### Solution 3 (Optional): [Name your approach]
+### Solution 3 (Optional): Optimistic Concurrency Control with Versioning
 
 **Architecture Overview:**
 
-[Your description here]
+Instead of locking (pessimistic), we take an optimistic approach: allow all threads to read and modify freely, but detect conflicts at write time. Each journey stored in cache includes a `Version` field. When updating, the thread reads the current version, performs its modification, and before writing back it verifies the version hasn't changed. If another thread wrote in between (version mismatch), the update is retried from the beginning.
 
 **Implementation Approach:**
 
-``csharp
-// Pseudocode or key code snippets
-``
+```csharp
+private const int MaxRetries = 50;
+
+public async Task<bool> UpdateSegmentStatusAsync(string journeyId, string segmentId, string newStatus)
+{
+    for (int attempt = 0; attempt < MaxRetries; attempt++)
+    {
+        // STEP 1: Read journey + its current version
+        var key = GetJourneyKey(journeyId);
+        var json = await _cacheService.GetAsync(key);
+        if (json == null) return false;
+
+        var journey = JsonSerializer.Deserialize<Journey>(json);
+        if (journey == null) return false;
+
+        var originalVersion = journey.Version;
+
+        // STEP 2: Modify
+        var segment = journey.Segments.FirstOrDefault(s => s.SegmentId == segmentId);
+        if (segment == null) return false;
+        segment.Status = newStatus;
+        journey.Version++;
+
+        // STEP 3: Conditional write — only if version still matches
+        var updated = await _cacheService.CompareAndSetAsync(
+            key,
+            originalVersion,
+            JsonSerializer.Serialize(journey));
+
+        if (updated)
+            return true;
+
+        // Version mismatch — another thread wrote first, retry
+    }
+    return false; // Exhausted retries
+}
+```
+
+Note: this requires adding a `Version` property to the `Journey` model and a `CompareAndSetAsync` method to `ICacheService`.
 
 **Pros:**
-- [List advantages]
+- **No locks at all** with no semaphores, no memory leak, no blocking
+- Under low API rate, most writes succeed on the first attempt
+- Naturally **distributed-safe** as the version check happens at the cache/Redis level, so it works across multiple API instances
+- This approach is widely known and used
 
 **Cons:**
-- [List disadvantages]
+- **Big amount of retries under high  API rates**: if many threads update the same journey simultaneously, most will fail and retry, potentially amplifying load
+- More complex to implement as requires changes to `ICacheService` interface and `Journey` model
+- Needs a `MaxRetries` limit and a strategy for what happens when retries are exhausted
+- Each retry re-reads from cache, adding extra round trips to the db/cache
 
 **Performance Impact:**
-- Throughput: [Your analysis]
-- Latency: [Your analysis]
-- Resource usage: [Your analysis]
+- Throughput: Excellent under low api rate as no blocking happens. Degrades under bigger pressure on api rate due to retries
+- Latency: Best-case is a single read-modify-write with no waiting. Worst-case is `MaxRetries` * full read-modify-write processing time
+- Resource usage: No in-memory state to accumulate: no semaphores, no dictionaries. Trade-off is extra cache reads on retries
 
 **Edge Cases Handled:**
-- [List edge cases this solution handles]
+- Concurrent updates to the same journey from any number of threads or instances
+- Works across multiple API instances (distributed-safe)
+- Naturally detects and recovers from conflicts without data loss
 
 **Edge Cases NOT Handled:**
-- [List limitations]
+- High api rate scenarios may exhaust retries and fail the request
+- Requires all writers to use versioning strategy. A single writer bypassing the version check breaks the guarantee
 
 ---
 

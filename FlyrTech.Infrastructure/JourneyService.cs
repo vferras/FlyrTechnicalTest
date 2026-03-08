@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Text.Json;
 using FlyrTech.Core;
 using FlyrTech.Core.Models;
@@ -6,19 +5,15 @@ using FlyrTech.Core.Models;
 namespace FlyrTech.Infrastructure;
 
 /// <summary>
-/// Journey service implementation with INTENTIONAL race condition issues
-/// This implementation reads the entire journey, modifies it, and writes it back
-/// causing race conditions when multiple concurrent updates occur
+/// Journey service using optimistic concurrency control with versioning.
+/// Instead of locking, we detect conflicts at write time and retry on version mismatch.
 /// </summary>
 public class JourneyService : IJourneyService
 {
     private readonly ICacheService _cacheService;
     private const string JourneyKeyPrefix = "journey:";
     private const string JourneyIdsKey = "journey:ids";
-    private static readonly ConcurrentDictionary<string, SemaphoreSlim> _semaphores = new();
-
-    private static SemaphoreSlim GetSemaphore(string journeyId) =>
-        _semaphores.GetOrAdd(journeyId, _ => new SemaphoreSlim(1, 1));
+    private const int MaxRetries = 50;
 
     public JourneyService(ICacheService cacheService)
     {
@@ -39,11 +34,6 @@ public class JourneyService : IJourneyService
         return JsonSerializer.Deserialize<Journey>(json);
     }
 
-    /// <summary>
-    /// INTENTIONAL RACE CONDITION:
-    /// This method reads the entire journey, modifies a segment, and writes back the entire journey.
-    /// When called concurrently, updates can overwrite each other, causing data loss.
-    /// </summary>
     public async Task<bool> UpdateSegmentStatusAsync(string journeyId, string segmentId, string newStatus)
     {
         if (string.IsNullOrWhiteSpace(journeyId))
@@ -52,38 +42,38 @@ public class JourneyService : IJourneyService
         if (string.IsNullOrWhiteSpace(segmentId))
             throw new ArgumentException("Segment ID cannot be null or empty", nameof(segmentId));
 
-        var semaphore = GetSemaphore(journeyId);
-        await semaphore.WaitAsync();
-        try
+        for (int attempt = 0; attempt < MaxRetries; attempt++)
         {
-            // STEP 1: Read the entire journey from cache
-            var journey = await GetJourneyAsync(journeyId);
+            // STEP 1: Read journey + its current version
+            var key = GetJourneyKey(journeyId);
+            var json = await _cacheService.GetAsync(key);
+            if (json == null) return false;
 
-            if (journey == null)
-                return false;
+            var journey = JsonSerializer.Deserialize<Journey>(json);
+            if (journey == null) return false;
+
+            var originalVersion = journey.Version;
 
             // STEP 2: Find and modify the segment
             var segment = journey.Segments.FirstOrDefault(s => s.SegmentId == segmentId);
-
-            if (segment == null)
-                return false;
-
-            // Simulate some processing time to increase the chance of race conditions
-            await Task.Delay(10);
+            if (segment == null) return false;
 
             segment.Status = newStatus;
+            journey.Version++;
 
-            // STEP 3: Write the entire journey back to cache
-            var key = GetJourneyKey(journeyId);
-            var json = JsonSerializer.Serialize(journey);
-            await _cacheService.SetAsync(key, json);
-        }
-        finally
-        {
-            semaphore.Release();
+            // STEP 3: Conditional write — only if version still matches
+            var updated = await _cacheService.CompareAndSetAsync(
+                key,
+                originalVersion,
+                JsonSerializer.Serialize(journey));
+
+            if (updated)
+                return true;
+
+            // Version mismatch — another thread wrote first, retry
         }
 
-        return true;
+        return false;
     }
 
     public async Task<bool> UpdateJourneyStatusAsync(string journeyId, string newStatus)
@@ -91,27 +81,30 @@ public class JourneyService : IJourneyService
         if (string.IsNullOrWhiteSpace(journeyId))
             throw new ArgumentException("Journey ID cannot be null or empty", nameof(journeyId));
 
-        var semaphore = GetSemaphore(journeyId);
-        await semaphore.WaitAsync();
-        try
+        for (int attempt = 0; attempt < MaxRetries; attempt++)
         {
-            var journey = await GetJourneyAsync(journeyId);
+            var key = GetJourneyKey(journeyId);
+            var json = await _cacheService.GetAsync(key);
+            if (json == null) return false;
 
-            if (journey == null)
-                return false;
+            var journey = JsonSerializer.Deserialize<Journey>(json);
+            if (journey == null) return false;
+
+            var originalVersion = journey.Version;
 
             journey.Status = newStatus;
+            journey.Version++;
 
-            var key = GetJourneyKey(journeyId);
-            var json = JsonSerializer.Serialize(journey);
-            await _cacheService.SetAsync(key, json);
+            var updated = await _cacheService.CompareAndSetAsync(
+                key,
+                originalVersion,
+                JsonSerializer.Serialize(journey));
+
+            if (updated)
+                return true;
         }
-        finally
-        {
-            semaphore.Release();
-        }
-        
-        return true;
+
+        return false;
     }
 
     public async Task<List<string>> GetAllJourneyIdsAsync()
@@ -129,9 +122,10 @@ public class JourneyService : IJourneyService
         if (journeys == null || journeys.Count == 0)
             return;
 
-        // Store each journey
+        // Store each journey with version 0
         foreach (var journey in journeys)
         {
+            journey.Version = 0;
             var key = GetJourneyKey(journey.Id);
             var json = JsonSerializer.Serialize(journey);
             await _cacheService.SetAsync(key, json);

@@ -67,4 +67,34 @@ public class RedisCacheService : ICacheService
 
         return await _database.KeyExistsAsync(key);
     }
+
+    /// <inheritdoc/>
+    public async Task<bool> CompareAndSetAsync(string key, int expectedVersion, string newValue)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+            throw new ArgumentException("Key cannot be null or empty", nameof(key));
+        if (newValue == null)
+            throw new ArgumentNullException(nameof(newValue));
+
+        // Lua script: atomically check version and set new value
+        // This runs as a single atomic operation in Redis
+        const string luaScript = @"
+            local current = redis.call('GET', KEYS[1])
+            if current == false then
+                return 0
+            end
+            local data = cjson.decode(current)
+            if data['Version'] ~= tonumber(ARGV[1]) then
+                return 0
+            end
+            redis.call('SET', KEYS[1], ARGV[2])
+            return 1";
+
+        var result = await _database.ScriptEvaluateAsync(
+            luaScript,
+            new RedisKey[] { key },
+            new RedisValue[] { expectedVersion, newValue });
+
+        return (int)result == 1;
+    }
 }

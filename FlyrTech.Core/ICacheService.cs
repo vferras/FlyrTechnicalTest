@@ -33,4 +33,14 @@ public interface ICacheService
     /// <param name="key">The cache key</param>
     /// <returns>True if the key exists, false otherwise</returns>
     Task<bool> ExistsAsync(string key);
+
+    /// <summary>
+    /// Atomically sets a value only if the stored version matches the expected version.
+    /// Used for optimistic concurrency control.
+    /// </summary>
+    /// <param name="key">The cache key</param>
+    /// <param name="expectedVersion">The version we expect to be currently stored</param>
+    /// <param name="newValue">The new value to set (must contain the incremented version)</param>
+    /// <returns>True if the value was set, false if the version didn't match (conflict)</returns>
+    Task<bool> CompareAndSetAsync(string key, int expectedVersion, string newValue);
 }
