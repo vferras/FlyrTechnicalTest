@@ -314,22 +314,25 @@ Note: this requires adding a `Version` property to the `Journey` model and a `Co
 
 | Criteria | Solution 1 | Solution 2 | Solution 3 |
 |----------|-----------|-----------|-----------|
-| Complexity | [Your rating] | [Your rating] | [Your rating] |
-| Performance | [Your rating] | [Your rating] | [Your rating] |
-| Scalability | [Your rating] | [Your rating] | [Your rating] |
-| Reliability | [Your rating] | [Your rating] | [Your rating] |
-| Implementation Time | [Your estimate] | [Your estimate] | [Your estimate] |
-| Maintenance Cost | [Your estimate] | [Your estimate] | [Your estimate] |
+| Complexity | Low | Medium | High |
+| Performance | Poor (global bottleneck) | Good (only same-key blocks) | Best under low api rates, degrades under high rates |
+| Scalability | Not scalable (single lock) | Scales well per journey | Scales horizontally (distributed-safe) |
+| Reliability | High (simple, hard to get wrong) | High (same guarantees, finer granularity) | Medium (retries can be exhausted) |
+| Implementation Time | ~30-60 min | ~1-2 hour | ~3-4 hours |
+| Maintenance Cost | Very low | Low (potential memory leak to manage) | Medium (versioning logic, retry tuning, Lua scripts) |
 
 ### 3.2 Recommended Solution
 
 **Which solution do you recommend for production and why?**
 
-[Your detailed recommendation here]
+For a **single-instance deployment**, I recommend **Solution 2** (per-key SemaphoreSlim). It provides the best balance between simplicity and performance: it eliminates the global bottleneck of Solution 1 by allowing parallel updates to different journeys, while keeping the implementation straightforward and easy to reason about. It guarantees correctness without the retry complexity of Solution 3. Specially if there are not much concurrent updates for the same id.
 
 **What are the trade-offs you're accepting with this choice?**
 
-[Your answer here]
+With Solution 2:
+- **Memory growth**: the `ConcurrentDictionary` accumulates semaphores for every unique journey ID. For long-running services this needs to be addressed with periodic cleanup.
+- **Not distributed-safe**: the in-memory locks only work within a single process. If we ever scale to multiple instances, we would need to migrate to Solution 3.
+- **Same-key serialization**: concurrent updates to the same journey are processed one at a time, which under very high contention on a single journey could become a bottleneck.
 
 ---
 
