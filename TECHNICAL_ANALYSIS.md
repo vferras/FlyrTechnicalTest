@@ -92,7 +92,7 @@ Since the bug is silent (no errors thrown, always returns true), detection requi
 This observability should be considering custom metrics, and I could think of different ways to detect:
 
 - Custom metric checking different sources for the status (different read models or comparing with a source of truth if possible). If the statuses for the Segment mismatch, then we can raise an alert.
-- That option is more a fix rather than a way to detect it, although it can be used to detect it: and that is using versioning for the updates. Each journey update stores a version field in cache, and every write increments the value. And before each update, we check the current version stored vs the expected version, and if they mismatch (current version + 1 > expected version) means that another thread updated the value in between. In that case we would raise an alert, or preferably, force that update to be retried and go through the read-modify-write again.
+- That option is more a fix rather than a way to detect it, although it can be used to detect it: and that is using versioning for the updates. Each journey update stores a version field in cache, and every write increments the value. And before each update, we check the current version stored vs the expected version, and if they mismatch (current version + 1 > expected version) means that another thread updated the value in between. In that case we would raise an alert, or preferably, force that update to be retried and go through the read-modify-write again (spoiler, that optimistic approach is going to be implemented in solution 3).
 - Although is not my preferred solution, another option would be to log each update with the expected value, so you can periodicly do kind of a state reconciliation.
 
 ---
@@ -169,34 +169,66 @@ public async Task<bool> UpdateSegmentStatusAsync(string journeyId, string segmen
 
 ---
 
-### Solution 2: [Name your approach]
+### Solution 2: Per-key SemaphoreSlim using ConcurrentDictionary
 
 **Architecture Overview:**
 
-[Your description here]
+Instead of a single global semaphore, we maintain a `ConcurrentDictionary<string, SemaphoreSlim>` keyed by `journeyId`. Now each journey gets its own semaphore, so threads updating different journeys no longer block each other: only concurrent updates to the **same** journey are serialized. `GetOrAdd` ensures the semaphore is created atomically on first access.
 
 **Implementation Approach:**
 
-``csharp
-// Pseudocode or key code snippets
-``
+```csharp
+private static readonly ConcurrentDictionary<string, SemaphoreSlim> _semaphores = new();
+
+private SemaphoreSlim GetSemaphore(string journeyId) =>
+    _semaphores.GetOrAdd(journeyId, _ => new SemaphoreSlim(1, 1));
+
+public async Task<bool> UpdateSegmentStatusAsync(string journeyId, string segmentId, string newStatus)
+{
+    var semaphore = GetSemaphore(journeyId);
+    await semaphore.WaitAsync();
+    try
+    {
+        var journey = await GetJourneyAsync(journeyId);
+        if (journey == null) return false;
+
+        var segment = journey.Segments.FirstOrDefault(s => s.SegmentId == segmentId);
+        if (segment == null) return false;
+        segment.Status = newStatus;
+
+        var key = GetJourneyKey(journeyId);
+        await _cacheService.SetAsync(key, JsonSerializer.Serialize(journey));
+    }
+    finally
+    {
+        semaphore.Release();
+    }
+    return true;
+}
+```
 
 **Pros:**
-- [List advantages]
+- Concurrent updates to **different** journeys no longer block each other, with much better throughput than Solution 1
+- Still correctly serializes concurrent updates to the **same** journey
+- Simple extension of Solution 1, minimal extra complexity
 
 **Cons:**
-- [List disadvantages]
+- **Memory leak** as semaphores are added to the dictionary but never removed. Long-running services with many distinct journey IDs will accumulate entries indefinitely
+- Still **not distributed-safe**, in-memory locks do not work across multiple API instances
+- Cleanup logic adds complexity if addressed
 
 **Performance Impact:**
-- Throughput: [Your analysis]
-- Latency: [Your analysis]
-- Resource usage: [Your analysis]
+- Throughput: Significantly better than Solution 1 as updates to independent journeys are run fully in parallel
+- Latency: Only requests for the **same** journey queue behind each other, and unrelated journeys are unaffected
+- Resource usage: memory increases dramatically because of adding items to the dictionary
 
 **Edge Cases Handled:**
-- [List edge cases this solution handles]
+- Concurrent updates to the same journey are correctly serialized
+- Concurrent updates to different journeys run in parallel without interference
 
 **Edge Cases NOT Handled:**
-- [List limitations]
+- Multiple API instances as the dictionary is in-memory and not shared across processes (same as Solution 1)
+- No cleanup of stale semaphores, so memory grows with the number of unique journey IDs
 
 ---
 

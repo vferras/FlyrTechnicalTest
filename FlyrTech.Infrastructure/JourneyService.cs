@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using FlyrTech.Core;
 using FlyrTech.Core.Models;
@@ -14,7 +15,10 @@ public class JourneyService : IJourneyService
     private readonly ICacheService _cacheService;
     private const string JourneyKeyPrefix = "journey:";
     private const string JourneyIdsKey = "journey:ids";
-    private static SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> _semaphores = new();
+
+    private static SemaphoreSlim GetSemaphore(string journeyId) =>
+        _semaphores.GetOrAdd(journeyId, _ => new SemaphoreSlim(1, 1));
 
     public JourneyService(ICacheService cacheService)
     {
@@ -48,7 +52,8 @@ public class JourneyService : IJourneyService
         if (string.IsNullOrWhiteSpace(segmentId))
             throw new ArgumentException("Segment ID cannot be null or empty", nameof(segmentId));
 
-        await _semaphore.WaitAsync();
+        var semaphore = GetSemaphore(journeyId);
+        await semaphore.WaitAsync();
         try
         {
             // STEP 1: Read the entire journey from cache
@@ -69,15 +74,13 @@ public class JourneyService : IJourneyService
             segment.Status = newStatus;
 
             // STEP 3: Write the entire journey back to cache
-            // PROBLEM: If another thread modified the journey between steps 1 and 3,
-            // those changes will be lost (overwritten by this update)
             var key = GetJourneyKey(journeyId);
             var json = JsonSerializer.Serialize(journey);
             await _cacheService.SetAsync(key, json);
         }
         finally
         {
-            _semaphore.Release();
+            semaphore.Release();
         }
 
         return true;
@@ -88,7 +91,8 @@ public class JourneyService : IJourneyService
         if (string.IsNullOrWhiteSpace(journeyId))
             throw new ArgumentException("Journey ID cannot be null or empty", nameof(journeyId));
 
-        await _semaphore.WaitAsync();
+        var semaphore = GetSemaphore(journeyId);
+        await semaphore.WaitAsync();
         try
         {
             var journey = await GetJourneyAsync(journeyId);
@@ -104,7 +108,7 @@ public class JourneyService : IJourneyService
         }
         finally
         {
-            _semaphore.Release();
+            semaphore.Release();
         }
         
         return true;
